@@ -7,7 +7,7 @@ const server = http.createServer((req, res) => {
         "Content-Type": "text/plain"
     });
 
-    res.end("Hello from my Docker Node.js server!!");
+    res.end("Hello from my Docker Node.js server version 1.0!!");
 });
 
 server.listen(PORT, () => {

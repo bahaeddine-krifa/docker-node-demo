@@ -31,10 +31,13 @@ jobs:
           run: npm test
 
         - name: Build Docker image
-          run: docker build -t docker-node-demo .
+          run: docker build -t ${{ secrets.DOCKER_USERNAME }}/docker-node-demo:latest .
         
-        - name: Run Docker container
-          run: docker run -d -p 3000:3000 --name node-server docker-node-demo
-        
-        - name: Test Docker container
-          run: curl http://localhost:3000
+        - name: Login to Docker Hub
+          uses: docker/login-action@v4
+          with:
+            username: ${{ secrets.DOCKER_USERNAME }}
+            password: ${{ secrets.DOCKER_PASSWORD }}
+
+        - name: Push Docker image
+          run: docker push ${{ secrets.DOCKER_USERNAME }}/docker-node-demo:latest
