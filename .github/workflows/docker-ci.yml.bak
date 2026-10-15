@@ -1,0 +1,151 @@
+name: Docker CI
+
+on:
+  push:
+    branches:
+        - master
+
+  pull_request:
+    branches:
+        - master
+
+jobs:
+  test-and-build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
+
+        - name: Setup Node.js
+          uses: actions/setup-node@v4
+          with:
+            node-version: '22'
+            cache: 'npm'
+        
+        - name: Install dependencies
+          run: npm ci
+
+        - name: Run tests
+          run: npm test
+
+        - name: Build Docker image
+          run: |
+            docker build \
+              -t ${{ secrets.DOCKER_USERNAME }}/docker-node-demo:${{ github.sha }} \
+              -t ${{ secrets.DOCKER_USERNAME }}/docker-node-demo:latest \
+              .
+
+        - name: Login to Docker Hub
+          uses: docker/login-action@v4
+          with:
+            username: ${{ secrets.DOCKER_USERNAME }}
+            password: ${{ secrets.DOCKER_PASSWORD }}
+
+        - name: Push Docker image
+          run: |
+            docker push ${{ secrets.DOCKER_USERNAME }}/docker-node-demo:${{ github.sha }}
+            docker push ${{ secrets.DOCKER_USERNAME }}/docker-node-demo:latest
+  
+  deploy:
+    name: Deploy to AWS EC2
+    needs: test-and-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: self-hosted
+
+    steps:
+      - name: Deploy Docker image on EC2
+        env:
+          IMAGE: ${{ secrets.DOCKER_USERNAME }}/docker-node-demo:${{ github.sha }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -eu
+
+          echo "$DOCKER_PASSWORD" | docker login \
+            --username "$DOCKER_USERNAME" \
+            --password-stdin
+
+          echo "Pulling $IMAGE"
+          docker pull "$IMAGE"
+
+          # Test the new image before replacing production.
+          docker rm -f node-server-candidate >/dev/null 2>&1 || true
+
+          docker run -d \
+            --name node-server-candidate \
+            -p 127.0.0.1:3001:3000 \
+            "$IMAGE"
+
+          HEALTHY=0
+          for i in $(seq 1 10); do
+            if curl -fsS http://127.0.0.1:3001/ >/dev/null; then
+              HEALTHY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$HEALTHY" -ne 1 ]; then
+            echo "Candidate health check failed"
+            docker logs node-server-candidate || true
+            docker rm -f node-server-candidate || true
+            exit 1
+          fi
+
+          docker rm -f node-server-candidate
+          echo "Candidate passed health check"
+
+          # Keep the previous version temporarily for rollback.
+          docker rm -f node-server-previous >/dev/null 2>&1 || true
+
+          if docker inspect node-server >/dev/null 2>&1; then
+            docker rename node-server node-server-previous
+            docker stop node-server-previous
+          fi
+
+          if ! docker run -d \
+            --name node-server \
+            --restart unless-stopped \
+            -p 127.0.0.1:3000:3000 \
+            "$IMAGE"; then
+
+            docker rm -f node-server >/dev/null 2>&1 || true
+
+            if docker inspect node-server-previous >/dev/null 2>&1; then
+              docker rename node-server-previous node-server
+              docker start node-server
+            fi
+
+            exit 1
+          fi
+
+          # Verify production before removing the previous version.
+          HEALTHY=0
+          for i in $(seq 1 10); do
+            if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
+              HEALTHY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$HEALTHY" -ne 1 ]; then
+            echo "New version failed its health check"
+            docker logs node-server || true
+            docker rm -f node-server || true
+
+            if docker inspect node-server-previous >/dev/null 2>&1; then
+              docker rename node-server-previous node-server
+              docker start node-server
+            fi
+
+            exit 1
+          fi
+
+          docker rm -f node-server-previous >/dev/null 2>&1 || true
+          docker logout
+
+          echo "Deployment successful"
+          docker ps

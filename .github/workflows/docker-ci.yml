@@ -55,31 +55,64 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - name: Deploy Docker image on EC2
+      - name: Deploy with Docker Compose and rollback
         env:
-          IMAGE: ${{ secrets.DOCKER_USERNAME }}/docker-node-demo:${{ github.sha }}
+          IMAGE_TAG: ${{ github.sha }}
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        shell: bash
         run: |
-          set -eu
+          set -Eeuo pipefail
+          cd "$HOME/node-app"
 
-          echo "$DOCKER_PASSWORD" | docker login \
-            --username "$DOCKER_USERNAME" \
-            --password-stdin
+          PROD_FILE=compose.production.yaml
+          CANDIDATE_FILE=compose.candidate.yaml
+          PROD_PROJECT=node-app-production
+          CANDIDATE_PROJECT=node-app-candidate
+          BACKUP=node-server-previous
+          IMAGE="$DOCKER_USERNAME/docker-node-demo:$IMAGE_TAG"
+          BACKUP_READY=0
 
-          echo "Pulling $IMAGE"
+          docker login --username "$DOCKER_USERNAME" \
+            --password-stdin <<< "$DOCKER_PASSWORD"
+
+          rollback() {
+            echo "Rolling back to the previous container..."
+
+            docker rm -f node-server >/dev/null 2>&1 || true
+
+            if [ "$BACKUP_READY" = "1" ] &&
+               docker inspect "$BACKUP" >/dev/null 2>&1; then
+              docker rename "$BACKUP" node-server
+              docker start node-server
+
+              for i in {1..10}; do
+                if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
+                  echo "Rollback successful."
+                  return 0
+                fi
+                sleep 2
+              done
+
+              echo "WARNING: rollback container did not pass health check."
+              return 1
+            fi
+
+            echo "No backup container available."
+            return 1
+          }
+
+          # Pull the exact commit image.
           docker pull "$IMAGE"
 
-          # Test the new image before replacing production.
+          # Test it on port 3001 before touching production.
           docker rm -f node-server-candidate >/dev/null 2>&1 || true
 
-          docker run -d \
-            --name node-server-candidate \
-            -p 127.0.0.1:3001:3000 \
-            "$IMAGE"
+          docker compose -p "$CANDIDATE_PROJECT" \
+            -f "$CANDIDATE_FILE" up -d --pull never
 
           HEALTHY=0
-          for i in $(seq 1 10); do
+          for i in {1..10}; do
             if curl -fsS http://127.0.0.1:3001/ >/dev/null; then
               HEALTHY=1
               break
@@ -88,42 +121,47 @@ jobs:
           done
 
           if [ "$HEALTHY" -ne 1 ]; then
-            echo "Candidate health check failed"
-            docker logs node-server-candidate || true
-            docker rm -f node-server-candidate || true
+            docker compose -p "$CANDIDATE_PROJECT" \
+              -f "$CANDIDATE_FILE" logs || true
+            docker compose -p "$CANDIDATE_PROJECT" \
+              -f "$CANDIDATE_FILE" down || true
+            docker logout
+            echo "Candidate failed; production was not changed."
             exit 1
           fi
 
-          docker rm -f node-server-candidate
-          echo "Candidate passed health check"
+          docker compose -p "$CANDIDATE_PROJECT" \
+            -f "$CANDIDATE_FILE" down
 
-          # Keep the previous version temporarily for rollback.
-          docker rm -f node-server-previous >/dev/null 2>&1 || true
+          # Preserve the existing production container.
+          docker rm -f "$BACKUP" >/dev/null 2>&1 || true
 
           if docker inspect node-server >/dev/null 2>&1; then
-            docker rename node-server node-server-previous
-            docker stop node-server-previous
-          fi
-
-          if ! docker run -d \
-            --name node-server \
-            --restart unless-stopped \
-            -p 127.0.0.1:3000:3000 \
-            "$IMAGE"; then
-
-            docker rm -f node-server >/dev/null 2>&1 || true
-
-            if docker inspect node-server-previous >/dev/null 2>&1; then
-              docker rename node-server-previous node-server
-              docker start node-server
+            if ! docker rename node-server "$BACKUP"; then
+              docker logout
+              exit 1
             fi
 
+            BACKUP_READY=1
+
+            if ! docker stop "$BACKUP"; then
+              rollback || true
+              docker logout
+              exit 1
+            fi
+          fi
+
+          # Start the new production version.
+          if ! docker compose -p "$PROD_PROJECT" \
+            -f "$PROD_FILE" up -d --pull never; then
+            rollback || true
+            docker logout
             exit 1
           fi
 
-          # Verify production before removing the previous version.
+          # Check production before discarding the backup.
           HEALTHY=0
-          for i in $(seq 1 10); do
+          for i in {1..10}; do
             if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
               HEALTHY=1
               break
@@ -132,20 +170,18 @@ jobs:
           done
 
           if [ "$HEALTHY" -ne 1 ]; then
-            echo "New version failed its health check"
-            docker logs node-server || true
-            docker rm -f node-server || true
-
-            if docker inspect node-server-previous >/dev/null 2>&1; then
-              docker rename node-server-previous node-server
-              docker start node-server
-            fi
-
+            docker compose -p "$PROD_PROJECT" \
+              -f "$PROD_FILE" logs || true
+            rollback || true
+            docker logout
             exit 1
           fi
 
-          docker rm -f node-server-previous >/dev/null 2>&1 || true
-          docker logout
+          # Keep the backup until the new version is confirmed healthy.
+          if [ "$BACKUP_READY" = "1" ]; then
+            docker rm -f "$BACKUP"
+          fi
 
-          echo "Deployment successful"
+          docker logout
+          echo "Deployment successful: $IMAGE"
           docker ps
