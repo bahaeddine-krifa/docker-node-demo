@@ -1,0 +1,149 @@
+
+name: Promote Staging Image to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Full 40-character commit SHA tested on staging"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-production:
+    name: Deploy approved image to production
+    runs-on: [self-hosted, production]
+    timeout-minutes: 10
+
+    steps:
+      - name: Deploy tested image with health check and rollback
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+
+          # Only accept a full commit SHA.
+          if [[ ! "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: image_tag must be a 40-character lowercase commit SHA."
+            exit 1
+          fi
+
+          cd "$HOME/node-app"
+
+          PROD_FILE=compose.production.yaml
+          CANDIDATE_FILE=compose.candidate.yaml
+          PROD_PROJECT=node-app-production
+          CANDIDATE_PROJECT=node-app-candidate
+          BACKUP=node-server-previous
+          IMAGE="$DOCKER_USERNAME/docker-node-demo:$IMAGE_TAG"
+          BACKUP_READY=0
+
+          docker login \
+            --username "$DOCKER_USERNAME" \
+            --password-stdin <<< "$DOCKER_PASSWORD"
+
+          rollback() {
+            echo "Rolling back to the previous production container..."
+            docker rm -f node-server >/dev/null 2>&1 || true
+
+            if [[ "$BACKUP_READY" == "1" ]] &&
+               docker inspect "$BACKUP" >/dev/null 2>&1; then
+              docker rename "$BACKUP" node-server
+              docker start node-server
+
+              for i in {1..15}; do
+                if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
+                  echo "Rollback successful."
+                  return 0
+                fi
+                sleep 2
+              done
+
+              echo "WARNING: rollback health check failed."
+              return 1
+            fi
+
+            echo "No previous production container is available."
+            return 1
+          }
+
+          # Pull the exact image tested on staging.
+          docker pull "$IMAGE"
+
+          # Test the candidate on port 3001.
+          docker rm -f node-server-candidate >/dev/null 2>&1 || true
+
+          docker compose -p "$CANDIDATE_PROJECT" \
+            -f "$CANDIDATE_FILE" up -d --pull never
+
+          HEALTHY=0
+          for i in {1..15}; do
+            if curl -fsS http://127.0.0.1:3001/ >/dev/null; then
+              HEALTHY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$HEALTHY" != "1" ]]; then
+            docker compose -p "$CANDIDATE_PROJECT" \
+              -f "$CANDIDATE_FILE" logs || true
+            docker compose -p "$CANDIDATE_PROJECT" \
+              -f "$CANDIDATE_FILE" down || true
+            docker logout
+            echo "Candidate failed. Production was not changed."
+            exit 1
+          fi
+
+          docker compose -p "$CANDIDATE_PROJECT" \
+            -f "$CANDIDATE_FILE" down
+
+          # Preserve the current production container.
+          docker rm -f "$BACKUP" >/dev/null 2>&1 || true
+
+          if docker inspect node-server >/dev/null 2>&1; then
+            docker rename node-server "$BACKUP"
+            BACKUP_READY=1
+            docker stop "$BACKUP"
+          fi
+
+          # Start the new version.
+          if ! docker compose -p "$PROD_PROJECT" \
+            -f "$PROD_FILE" up -d --pull never; then
+            rollback || true
+            docker logout
+            exit 1
+          fi
+
+          # Verify the live production endpoint.
+          HEALTHY=0
+          for i in {1..15}; do
+            if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
+              HEALTHY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$HEALTHY" != "1" ]]; then
+            docker compose -p "$PROD_PROJECT" \
+              -f "$PROD_FILE" logs || true
+            rollback || true
+            docker logout
+            exit 1
+          fi
+
+          # Retain the previous container until the new one passes.
+          if [[ "$BACKUP_READY" == "1" ]]; then
+            docker rm -f "$BACKUP"
+          fi
+
+          docker logout
+          echo "Production deployment successful: $IMAGE"
+          docker ps
