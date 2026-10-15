@@ -2,12 +2,12 @@
 name: Promote Staging Image to Production
 
 on:
-  workflow_dispatch:
-    inputs:
-      image_tag:
-        description: "Full 40-character commit SHA tested on staging"
-        required: true
-        type: string
+  workflow_run:
+    workflows: ["Staging CI/CD"]
+    types:
+      - completed
+    branches:
+      - staging
 
 permissions:
   contents: read
@@ -16,13 +16,14 @@ permissions:
 jobs:
   verify-staging:
     name: Verify successful staging deployment
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
 
     steps:
       - name: Validate commit SHA
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
         shell: bash
         run: |
           if [[ ! "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
@@ -33,7 +34,7 @@ jobs:
       - name: Check staging workflow result
         uses: actions/github-script@v7
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
         with:
           script: |
             const sha = process.env.IMAGE_TAG;
@@ -83,7 +84,7 @@ jobs:
       - name: Deploy tested image with health check and rollback
         shell: bash
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
