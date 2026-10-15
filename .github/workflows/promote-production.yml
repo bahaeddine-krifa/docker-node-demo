@@ -72,6 +72,9 @@ jobs:
     runs-on: [self-hosted, production]
     timeout-minutes: 10
 
+    environment:
+      name: production
+
     concurrency:
       group: production-deployment
       cancel-in-progress: false
