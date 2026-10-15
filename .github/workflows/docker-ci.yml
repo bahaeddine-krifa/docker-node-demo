@@ -75,7 +75,7 @@ jobs:
 
             sudo docker run -d \
               --name node-server-candidate \
-              -p 3001:3000 \
+              -p 127.0.0.1:3001:3000 \
               "$IMAGE"
 
             # Wait up to 20 seconds for the application.
@@ -110,7 +110,7 @@ jobs:
             if ! sudo docker run -d \
               --name node-server \
               --restart unless-stopped \
-              -p 3000:3000 \
+              -p 127.0.0.1:3000:3000 \
               "$IMAGE"; then
               sudo docker rm -f node-server >/dev/null 2>&1 || true
               if sudo docker inspect node-server-previous >/dev/null 2>&1; then
