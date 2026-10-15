@@ -51,7 +51,7 @@ jobs:
   deploy:
     name: Deploy to AWS EC2
     needs: test-and-build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: self-hosted
 
     steps:
