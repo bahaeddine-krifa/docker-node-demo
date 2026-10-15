@@ -51,100 +51,101 @@ jobs:
   deploy:
     name: Deploy to AWS EC2
     needs: test-and-build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
 
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.2.2
+      - name: Deploy Docker image on EC2
         env:
           IMAGE: ${{ secrets.DOCKER_USERNAME }}/docker-node-demo:${{ github.sha }}
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          envs: IMAGE
-          script: |
-            set -eu
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -eu
 
-            echo "Pulling $IMAGE"
-            sudo docker pull "$IMAGE"
+          echo "$DOCKER_PASSWORD" | docker login \
+            --username "$DOCKER_USERNAME" \
+            --password-stdin
 
-            # Start a temporary candidate container.
-            sudo docker rm -f node-server-candidate >/dev/null 2>&1 || true
+          echo "Pulling $IMAGE"
+          docker pull "$IMAGE"
 
-            sudo docker run -d \
-              --name node-server-candidate \
-              -p 127.0.0.1:3001:3000 \
-              "$IMAGE"
+          # Test the new image before replacing production.
+          docker rm -f node-server-candidate >/dev/null 2>&1 || true
 
-            # Wait up to 20 seconds for the application.
-            HEALTHY=0
-            for i in $(seq 1 10); do
-              if curl -fsS http://127.0.0.1:3001/ >/dev/null; then
-                HEALTHY=1
-                break
-              fi
-              sleep 2
-            done
+          docker run -d \
+            --name node-server-candidate \
+            -p 127.0.0.1:3001:3000 \
+            "$IMAGE"
 
-            if [ "$HEALTHY" -ne 1 ]; then
-              echo "Candidate health check failed"
-              sudo docker logs node-server-candidate || true
-              sudo docker rm -f node-server-candidate || true
-              exit 1
+          HEALTHY=0
+          for i in $(seq 1 10); do
+            if curl -fsS http://127.0.0.1:3001/ >/dev/null; then
+              HEALTHY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$HEALTHY" -ne 1 ]; then
+            echo "Candidate health check failed"
+            docker logs node-server-candidate || true
+            docker rm -f node-server-candidate || true
+            exit 1
+          fi
+
+          docker rm -f node-server-candidate
+          echo "Candidate passed health check"
+
+          # Keep the previous version temporarily for rollback.
+          docker rm -f node-server-previous >/dev/null 2>&1 || true
+
+          if docker inspect node-server >/dev/null 2>&1; then
+            docker rename node-server node-server-previous
+            docker stop node-server-previous
+          fi
+
+          if ! docker run -d \
+            --name node-server \
+            --restart unless-stopped \
+            -p 127.0.0.1:3000:3000 \
+            "$IMAGE"; then
+
+            docker rm -f node-server >/dev/null 2>&1 || true
+
+            if docker inspect node-server-previous >/dev/null 2>&1; then
+              docker rename node-server-previous node-server
+              docker start node-server
             fi
 
-            sudo docker rm -f node-server-candidate
-            echo "Candidate passed health check"
+            exit 1
+          fi
 
-            # Preserve the previous container for rollback.
-            sudo docker rm -f node-server-previous >/dev/null 2>&1 || true
+          # Verify production before removing the previous version.
+          HEALTHY=0
+          for i in $(seq 1 10); do
+            if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
+              HEALTHY=1
+              break
+            fi
+            sleep 2
+          done
 
-            if sudo docker inspect node-server >/dev/null 2>&1; then
-              sudo docker rename node-server node-server-previous
-              sudo docker stop node-server-previous
+          if [ "$HEALTHY" -ne 1 ]; then
+            echo "New version failed its health check"
+            docker logs node-server || true
+            docker rm -f node-server || true
+
+            if docker inspect node-server-previous >/dev/null 2>&1; then
+              docker rename node-server-previous node-server
+              docker start node-server
             fi
 
-            # Start the new version.
-            if ! sudo docker run -d \
-              --name node-server \
-              --restart unless-stopped \
-              -p 127.0.0.1:3000:3000 \
-              "$IMAGE"; then
-              sudo docker rm -f node-server >/dev/null 2>&1 || true
-              if sudo docker inspect node-server-previous >/dev/null 2>&1; then
-                sudo docker rename node-server-previous node-server
-                sudo docker start node-server
-              fi
-              exit 1
-            fi
+            exit 1
+          fi
 
-            # Verify the live version.
-            HEALTHY=0
-            for i in $(seq 1 10); do
-              if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
-                HEALTHY=1
-                break
-              fi
-              sleep 2
-            done
+          docker rm -f node-server-previous >/dev/null 2>&1 || true
+          docker logout
 
-            if [ "$HEALTHY" -ne 1 ]; then
-              echo "New version failed its health check"
-              sudo docker logs node-server || true
-              sudo docker rm -f node-server || true
-
-              if sudo docker inspect node-server-previous >/dev/null 2>&1; then
-                sudo docker rename node-server-previous node-server
-                sudo docker start node-server
-              fi
-
-              exit 1
-            fi
-
-            # The new version is healthy; remove the old container.
-            sudo docker rm -f node-server-previous >/dev/null 2>&1 || true
-
-            echo "Deployment successful"
-            sudo docker ps
+          echo "Deployment successful"
+          docker ps
