@@ -11,12 +11,70 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
+  verify-staging:
+    name: Verify successful staging deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Validate commit SHA
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        shell: bash
+        run: |
+          if [[ ! "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: Provide a full 40-character lowercase commit SHA."
+            exit 1
+          fi
+
+      - name: Check staging workflow result
+        uses: actions/github-script@v7
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        with:
+          script: |
+            const sha = process.env.IMAGE_TAG;
+
+            const response = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "staging.yml",
+              branch: "staging",
+              head_sha: sha,
+              status: "completed",
+              per_page: 100
+            });
+
+            const successfulRun = response.data.workflow_runs.some(run =>
+              run.head_sha.toLowerCase() === sha &&
+              run.event === "push" &&
+              run.status === "completed" &&
+              run.conclusion === "success"
+            );
+
+            if (!successfulRun) {
+              core.setFailed(
+                `No successful Staging CI/CD run found for commit ${sha}. ` +
+                "Deploy to staging and ensure the entire workflow succeeds first."
+              );
+              return;
+            }
+
+            core.notice(
+              `Verified successful staging workflow for commit ${sha}.`
+            );  
   deploy-production:
     name: Deploy approved image to production
+    needs: verify-staging
     runs-on: [self-hosted, production]
     timeout-minutes: 10
+
+    concurrency:
+      group: production-deployment
+      cancel-in-progress: false
 
     steps:
       - name: Deploy tested image with health check and rollback
