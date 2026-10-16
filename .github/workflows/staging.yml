@@ -111,25 +111,37 @@ jobs:
           set -euo pipefail
           docker push "$DOCKER_USERNAME/docker-node-demo:$GITHUB_SHA"
 
+      - name: Resolve pushed image digest
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        run: |
+          set -euo pipefail
+          IMAGE="$DOCKER_USERNAME/docker-node-demo"
+
+          DIGEST="$(docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" \
+            | awk '/^Digest:/ {print $2; exit}')"
+
+          if [ -z "$DIGEST" ]; then
+            echo "Could not resolve the pushed image digest."
+            exit 1
+          fi
+
+          echo "IMAGE_DIGEST=$IMAGE@$DIGEST" >> "$GITHUB_ENV"
+          echo "Resolved image: $IMAGE@$DIGEST"
+
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.0.0
 
       - name: Sign Docker image
-        env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
         run: |
           set -euo pipefail
-          IMAGE="$DOCKER_USERNAME/docker-node-demo:$GITHUB_SHA"
-          cosign sign --yes "$IMAGE"
+          echo "Signing $IMAGE_DIGEST"
+          cosign sign --yes "$IMAGE_DIGEST"
 
       - name: Verify Docker image signature
-        env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
         run: |
           set -euo pipefail
-          IMAGE="$DOCKER_USERNAME/docker-node-demo:$GITHUB_SHA"
-
-          cosign verify "$IMAGE" \
+          cosign verify "$IMAGE_DIGEST" \
             --certificate-identity="https://github.com/bahaeddine-krifa/docker-node-demo/.github/workflows/staging.yml@refs/heads/staging" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
   deploy-staging:
