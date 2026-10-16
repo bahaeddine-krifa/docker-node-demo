@@ -81,6 +81,11 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.0.0
+        with:
+          cosign-release: v2.6.1
+
       - name: Deploy tested image with health check and rollback
         shell: bash
         env:
@@ -109,6 +114,13 @@ jobs:
           docker login \
             --username "$DOCKER_USERNAME" \
             --password-stdin <<< "$DOCKER_PASSWORD"
+          
+          # Verify that the staging workflow signed this image.
+          cosign verify "$IMAGE" \
+            --certificate-identity="https://github.com/bahaeddine-krifa/docker-node-demo/.github/workflows/staging.yml@refs/heads/staging" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+          echo "Image signature verified successfully."
 
           rollback() {
             echo "Rolling back to the previous production container..."
