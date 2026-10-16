@@ -25,7 +25,7 @@ test('GET / returns the expected response', async (t) => {
 
   assert.equal(
     await response.text(),
-    'This is the wrong message'
+    'Hello from my Docker Node.js server!!'
   );
 
   assert.match(
