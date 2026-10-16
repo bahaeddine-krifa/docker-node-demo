@@ -51,6 +51,32 @@ jobs:
           IMAGE="$DOCKER_USERNAME/docker-node-demo"
           docker build -t "$IMAGE:$GITHUB_SHA" .
 
+      - name: Generate SBOM
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        run: |
+          set -euo pipefail
+          IMAGE="$DOCKER_USERNAME/docker-node-demo:$GITHUB_SHA"
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/" \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            aquasec/trivy:0.70.0 \
+            image \
+            --format cyclonedx \
+            --output /work/sbom.cdx.json \
+            "$IMAGE"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-sbom
+          path: sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 30    
+          
       - name: Scan image with Trivy
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
